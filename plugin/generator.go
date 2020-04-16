@@ -31,6 +31,7 @@ type CaddyfileGenerator struct {
 	caddyFilePath        string
 	labelPrefix          string
 	labelRegex           *regexp.Regexp
+	ignoreSwarmError     bool
 	proxyServiceTasks    bool
 	validateNetwork      bool
 	dockerClient         DockerClient
@@ -45,12 +46,14 @@ var suffixRegex = regexp.MustCompile("_\\d+$")
 
 var labelPrefixFlag string
 var caddyFilePath string
+var ignoreSwarmErrorFlag bool
 var proxyServiceTasksFlag bool
 var validateNetworkFlag bool
 
 func init() {
 	flag.StringVar(&labelPrefixFlag, "docker-label-prefix", defaultLabelPrefix, "Prefix for Docker labels")
 	flag.StringVar(&caddyFilePath, "docker-caddyfile-path", "", "Path to a default CaddyFile")
+	flag.BoolVar(&ignoreSwarmErrorFlag, "docker-ignore-swarm-error", false, "Skip updating caddyfile if swarm is unavailable")
 	flag.BoolVar(&proxyServiceTasksFlag, "proxy-service-tasks", false, "Proxy to service tasks instead of service load balancer")
 	flag.BoolVar(&validateNetworkFlag, "docker-validate-network", true, "Validates if caddy container and target are in same network")
 }
@@ -59,6 +62,7 @@ func init() {
 type GeneratorOptions struct {
 	caddyFilePath     string
 	labelPrefix       string
+	ignoreSwarmError  bool
 	proxyServiceTasks bool
 	validateNetwork   bool
 }
@@ -71,6 +75,12 @@ func GetGeneratorOptions() *GeneratorOptions {
 		options.caddyFilePath = caddyFilePathEnv
 	} else {
 		options.caddyFilePath = caddyFilePath
+	}
+
+	if ignoreSwarmErrorEnv := os.Getenv("CADDY_DOCKER_IGNORE_SWARM_ERROR"); ignoreSwarmErrorEnv != "" {
+		options.ignoreSwarmError = isTrue.MatchString(ignoreSwarmErrorEnv)
+	} else {
+		options.ignoreSwarmError = ignoreSwarmErrorFlag
 	}
 
 	if labelPrefixEnv := os.Getenv("CADDY_DOCKER_LABEL_PREFIX"); labelPrefixEnv != "" {
@@ -104,13 +114,14 @@ func CreateGenerator(dockerClient DockerClient, dockerUtils DockerUtils, options
 		dockerUtils:       dockerUtils,
 		labelPrefix:       options.labelPrefix,
 		labelRegex:        regexp.MustCompile(labelRegexString),
+		ignoreSwarmError:  options.ignoreSwarmError,
 		proxyServiceTasks: options.proxyServiceTasks,
 		validateNetwork:   options.validateNetwork,
 	}
 }
 
 // GenerateCaddyFile generates a caddy file config from docker swarm
-func (g *CaddyfileGenerator) GenerateCaddyFile() ([]byte, string) {
+func (g *CaddyfileGenerator) GenerateCaddyFile() ([]byte, string, error) {
 	var caddyfileBuffer bytes.Buffer
 	var logsBuffer bytes.Buffer
 
@@ -129,6 +140,11 @@ func (g *CaddyfileGenerator) GenerateCaddyFile() ([]byte, string) {
 	if time.Since(g.swarmIsAvailableTime) > swarmAvailabilityCacheInterval {
 		g.checkSwarmAvailability(time.Time.IsZero(g.swarmIsAvailableTime))
 		g.swarmIsAvailableTime = time.Now()
+	}
+
+	if g.ignoreSwarmError && !g.swarmIsAvailable {
+		// return error to skip updating caddyfile
+		return nil, logsBuffer.String(), fmt.Errorf("swarm is unavailable")
 	}
 
 	directives := map[string]*directiveData{}
@@ -174,10 +190,18 @@ func (g *CaddyfileGenerator) GenerateCaddyFile() ([]byte, string) {
 					}
 				} else {
 					logsBuffer.WriteString(fmt.Sprintf("[ERROR] %v\n", err.Error()))
+					if g.ignoreSwarmError {
+						// return error to skip updating caddyfile
+						return nil, logsBuffer.String(), fmt.Errorf("swarm is unavailable for getServiceDirectives")
+					}
 				}
 			}
 		} else {
 			logsBuffer.WriteString(fmt.Sprintf("[ERROR] %v\n", err.Error()))
+			if g.ignoreSwarmError {
+				// return error to skip updating caddyfile
+				return nil, logsBuffer.String(), fmt.Errorf("swarm is unavailable for ServiceList")
+			}
 		}
 	} else {
 		logsBuffer.WriteString("[INFO] Skipping services because swarm is not available\n")
@@ -194,11 +218,19 @@ func (g *CaddyfileGenerator) GenerateCaddyFile() ([]byte, string) {
 						caddyfileBuffer.WriteRune('\n')
 					} else {
 						logsBuffer.WriteString(fmt.Sprintf("[ERROR] %v\n", err.Error()))
+						if g.ignoreSwarmError {
+							// return error to skip updating caddyfile
+							return nil, logsBuffer.String(), fmt.Errorf("swarm is unavailable for ConfigInspectWithRaw")
+						}
 					}
 				}
 			}
 		} else {
 			logsBuffer.WriteString(fmt.Sprintf("[ERROR] %v\n", err.Error()))
+			if g.ignoreSwarmError {
+				// return error to skip updating caddyfile
+				return nil, logsBuffer.String(), fmt.Errorf("swarm is unavailable for ConfigList")
+			}
 		}
 	} else {
 		logsBuffer.WriteString("[INFO] Skipping configs because swarm is not available\n")
@@ -206,7 +238,7 @@ func (g *CaddyfileGenerator) GenerateCaddyFile() ([]byte, string) {
 
 	writeDirectives(&caddyfileBuffer, directives, 0)
 
-	return caddyfileBuffer.Bytes(), logsBuffer.String()
+	return caddyfileBuffer.Bytes(), logsBuffer.String(), nil
 }
 
 func (g *CaddyfileGenerator) checkSwarmAvailability(isFirstCheck bool) {

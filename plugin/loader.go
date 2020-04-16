@@ -143,7 +143,14 @@ func (dockerLoader *DockerLoader) update(reloadIfChanged bool) bool {
 	dockerLoader.timer.Reset(pollingInterval)
 	dockerLoader.skipEvents = false
 
-	caddyfile, logs := dockerLoader.generator.GenerateCaddyFile()
+	caddyfile, logs, err := dockerLoader.generator.GenerateCaddyFile()
+
+	// error is returned if docker swarm is down and we want to leave the caddyfile as is
+	if err != nil {
+		log.Printf("[INFO] ignoring docker swarm error, leaving caddyfile as is: %v\n", err.Error())
+		return false
+	}
+
 	caddyfileChanged := !bytes.Equal(dockerLoader.previousCaddyfile, caddyfile)
 	logsChanged := dockerLoader.previousLogs != logs
 	dockerLoader.previousCaddyfile = caddyfile
