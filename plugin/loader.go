@@ -107,10 +107,14 @@ func (dockerLoader *DockerLoader) monitorEvents() {
 	args.Add("type", "container")
 	args.Add("type", "config")
 
-	eventsChan, errorChan := dockerLoader.dockerClient.Events(context.Background(), types.EventsOptions{
+	ctx := context.Background()
+	cancelCtx, cancelFunc := context.WithCancel(ctx)
+
+	eventsChan, errorChan := dockerLoader.dockerClient.Events(cancelCtx, types.EventsOptions{
 		Filters: args,
 	})
 
+	forloop: // label the for loop so we can break out of it
 	for {
 		select {
 		case event := <-eventsChan:
@@ -134,7 +138,16 @@ func (dockerLoader *DockerLoader) monitorEvents() {
 				dockerLoader.timer.Reset(100 * time.Millisecond)
 			}
 		case err := <-errorChan:
-			log.Println(err)
+			if err == nil {
+				// docker client event error, is the docker socket no longer accessible?
+				// cancel the context, otherwise the for loop errors forever
+				cancelFunc()
+				break forloop // break out of the for loop
+			} else {
+				// log unknown error
+				log.Println(err)
+			}
+
 		}
 	}
 }
